@@ -2,13 +2,22 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     loader::get_app_data_by_name,
-    mm::{translated_refmut, translated_str},
+    mm::{translated_refmut, translated_str, MapPermission, PageTable, VirtAddr},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        suspend_current_and_run_next, TaskControlBlock,
     },
+    timer::get_time_us,
 };
+
+/// SV39 下用户态规范虚拟地址的上界（2^38）。
+///
+/// 高于它的地址（如 isize::MAX）在硬件看来是非规范地址，
+/// 但内核按 9+9+9 位索引页表时会绕回到跳板页所在的页表项，
+/// 因此必须在查页表之前显式拦掉。
+const USER_SPACE_TOP: usize = 1 << 38;
 
 #[repr(C)]
 #[derive(Debug)]
@@ -67,7 +76,11 @@ pub fn sys_exec(path: *const u8) -> isize {
 /// If there is not a child process whose pid is same as given, return -1.
 /// Else if there is a child process but it is still running, return -2.
 pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
-    trace!("kernel::pid[{}] sys_waitpid [{}]", current_task().unwrap().pid.0, pid);
+    trace!(
+        "kernel::pid[{}] sys_waitpid [{}]",
+        current_task().unwrap().pid.0,
+        pid
+    );
     let task = current_task().unwrap();
     // find a child process
 
@@ -102,33 +115,85 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
     // ---- release current PCB automatically
 }
 
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// get time with second and microsecond
+///
+/// `TimeVal` 占 16 字节，可能横跨两个页面：如果第二页没有映射，
+/// 直接用裸指针写会触发内核缺页。所以逐页通过页表定位物理帧后再写。
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let data = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    if write_user_bytes(current_user_token(), ts as usize, data) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// mmap：在当前进程地址空间中申请一段用户可访问的映射
+///
+/// `prot` 的 bit0/bit1/bit2 分别表示 R/W/X（与 POSIX 一致）。
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    // 长度非 0、起点页对齐、prot 只能是 R/W/X 的组合且至少有一位
+    if len == 0 || start % PAGE_SIZE != 0 || prot == 0 || prot & !0b111 != 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) if end <= USER_SPACE_TOP => end,
+        _ => return -1,
+    };
+    let perm = match MapPermission::from_bits(((prot as u8) << 1) | MapPermission::U.bits()) {
+        Some(perm) => perm,
+        None => return -1,
+    };
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if !inner
+        .memory_set
+        .is_range_free(VirtAddr::from(start), VirtAddr::from(end))
+    {
+        return -1;
+    }
+    inner
+        .memory_set
+        .insert_framed_area(VirtAddr::from(start), VirtAddr::from(end), perm);
+    flush_tlb();
+    0
 }
 
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// munmap：解除当前进程地址空间中一段已建立的映射
+///
+/// 要求 start 与 len 都页对齐，且区间内每一页都已映射。
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    if len == 0 || start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) if end <= USER_SPACE_TOP => end,
+        _ => return -1,
+    };
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if inner
+        .memory_set
+        .unmap_range(VirtAddr::from(start), VirtAddr::from(end))
+    {
+        flush_tlb();
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -141,21 +206,71 @@ pub fn sys_sbrk(size: i32) -> isize {
     }
 }
 
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// spawn：以指定的 ELF 为内容创建一个全新子进程，返回其 pid
+///
+/// 与 fork + exec 的区别：fork 会拿到一份父进程地址空间的副本，
+/// 子进程还要先“从 fork 返回”再 exec；spawn 直接从 ELF 建地址空间，
+/// 子进程的入口就是 ELF 的 entry point。
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    if let Some(data) = get_app_data_by_name(path.as_str()) {
+        let parent = current_task().unwrap();
+        let child = TaskControlBlock::new(data);
+        let pid = child.getpid();
+        // 记录父进程（Weak 不增加引用计数，避免循环引用）
+        child.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+        let child = Arc::new(child);
+        // 挂到父进程的 children 列表，否则 wait 找不到它
+        parent.inner_exclusive_access().children.push(child.clone());
+        add_task(child);
+        pid as isize
+    } else {
+        -1
+    }
 }
 
-// YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
+/// set_priority：设置当前进程的优先级
+///
+/// 优先级必须 >= 2，否则返回 -1；成功则返回设置后的优先级。
+/// 越大越优先：在 stride 调度中它会导致更小的步长，从而获得更多 CPU 时间。
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+        "kernel:pid[{}] sys_set_priority {}",
+        current_task().unwrap().pid.0,
+        prio
     );
-    -1
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    task.inner_exclusive_access().priority = prio as usize;
+    prio
+}
+
+/// 修改页表后刷新 TLB，避免残留的旧映射被继续使用
+fn flush_tlb() {
+    unsafe { core::arch::asm!("sfence.vma") };
+}
+
+/// 把 `data` 逐字节写到用户地址 `addr`，每跨一页重新查一次页表。
+/// 任一页未映射或没有写权限则返回 false。
+fn write_user_bytes(token: usize, addr: usize, data: &[u8]) -> bool {
+    if addr.checked_add(data.len()).is_none() || addr + data.len() > USER_SPACE_TOP {
+        return false;
+    }
+    let mut done = 0usize;
+    while done < data.len() {
+        let va = VirtAddr::from(addr + done);
+        let pte = match PageTable::from_token(token).translate(va.floor()) {
+            Some(pte) if pte.is_valid() && pte.writable() => pte,
+            _ => return false,
+        };
+        let offset = va.page_offset();
+        let n = core::cmp::min(PAGE_SIZE - offset, data.len() - done);
+        pte.ppn().get_bytes_array()[offset..offset + n].copy_from_slice(&data[done..done + n]);
+        done += n;
+    }
+    true
 }

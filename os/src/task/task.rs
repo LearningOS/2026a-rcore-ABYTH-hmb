@@ -9,6 +9,9 @@ use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::cell::RefMut;
 
+/// 新进程的默认优先级
+pub const DEFAULT_PRIORITY: usize = 16;
+
 /// Task control block structure
 ///
 /// Directly save the contents that will not change during running
@@ -68,6 +71,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// 进程优先级（越大越优先），默认 16
+    pub priority: usize,
+
+    /// stride 调度中的“已经跑过多少”，每次被调度增加 BIG_STRIDE / priority
+    pub pass: u64,
 }
 
 impl TaskControlBlockInner {
@@ -118,6 +127,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: DEFAULT_PRIORITY,
+                    pass: 0,
                 })
             },
         };
@@ -191,6 +202,9 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    // 子进程继承父进程的优先级
+                    priority: parent_inner.priority,
+                    pass: 0,
                 })
             },
         });

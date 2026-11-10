@@ -21,3 +21,6 @@ pub const TRAP_CONTEXT_BASE: usize = TRAMPOLINE - PAGE_SIZE;
 pub const CLOCK_FREQ: usize = 12500000;
 /// the physical memory end
 pub const MEMORY_END: usize = 0x88000000;
+/// stride 调度的基准步长：所有进程 stride 之和应小于它
+#[allow(unused)]
+pub const BIG_STRIDE: u64 = 1 << 32;

@@ -23,6 +23,7 @@ mod switch;
 mod task;
 
 use crate::fs::{open_file, OpenFlags};
+use crate::mm::{MapPermission, VirtAddr};
 use alloc::sync::Arc;
 pub use context::TaskContext;
 use lazy_static::*;
@@ -53,6 +54,24 @@ pub fn suspend_current_and_run_next() {
     add_task(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
+}
+
+/// 在当前任务地址空间中映射 [start_va, end_va)，区间已被占用则返回 false
+pub fn mmap_current_area(start_va: VirtAddr, end_va: VirtAddr, perm: MapPermission) -> bool {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    if !inner.memory_set.is_range_free(start_va, end_va) {
+        return false;
+    }
+    inner.memory_set.insert_framed_area(start_va, end_va, perm);
+    true
+}
+
+/// 解除当前任务地址空间中 [start_va, end_va) 的映射，失败返回 false
+pub fn munmap_current_area(start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.unmap_range(start_va, end_va)
 }
 
 /// pid of usertests app in make run TEST=1

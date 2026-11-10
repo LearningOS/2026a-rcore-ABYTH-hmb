@@ -4,6 +4,13 @@ mod inode;
 mod stdio;
 
 use crate::mm::UserBuffer;
+use alloc::sync::Arc;
+use easy_fs::Inode;
+
+/// 获取文件系统根目录的 inode
+pub fn root_inode() -> Arc<Inode> {
+    inode::ROOT_INODE.clone()
+}
 
 /// trait File for all file types
 pub trait File: Send + Sync {
@@ -15,11 +22,21 @@ pub trait File: Send + Sync {
     fn read(&self, buf: UserBuffer) -> usize;
     /// write to the file from buf, return the number of bytes written
     fn write(&self, buf: UserBuffer) -> usize;
+    /// 获取文件的元信息；默认返回全零（仅普通文件有意义）
+    fn stat(&self) -> Stat {
+        Stat {
+            dev: 0,
+            ino: 0,
+            mode: StatMode::NULL,
+            nlink: 0,
+            pad: [0; 7],
+        }
+    }
 }
 
 /// The stat of a inode
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Stat {
     /// ID of device containing file
     pub dev: u64,

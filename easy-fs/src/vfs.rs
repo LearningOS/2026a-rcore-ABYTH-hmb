@@ -10,8 +10,22 @@ use spin::{Mutex, MutexGuard};
 pub struct Inode {
     block_id: usize,
     block_offset: usize,
+    inode_id: u32,
     fs: Arc<Mutex<EasyFileSystem>>,
     block_device: Arc<dyn BlockDevice>,
+}
+
+/// inode 的元信息快照（供 fstat 使用）
+#[derive(Clone, Copy)]
+pub struct InodeMeta {
+    /// inode 编号，同一文件的所有硬链接共享同一个值
+    pub inode_id: u32,
+    /// 文件字节数
+    pub size: u32,
+    /// 是否为目录
+    pub is_dir: bool,
+    /// 硬链接数
+    pub nlink: u32,
 }
 
 impl Inode {
@@ -19,12 +33,14 @@ impl Inode {
     pub fn new(
         block_id: u32,
         block_offset: usize,
+        inode_id: u32,
         fs: Arc<Mutex<EasyFileSystem>>,
         block_device: Arc<dyn BlockDevice>,
     ) -> Self {
         Self {
             block_id: block_id as usize,
             block_offset,
+            inode_id,
             fs,
             block_device,
         }
@@ -67,6 +83,7 @@ impl Inode {
                 Arc::new(Self::new(
                     block_id,
                     block_offset,
+                    inode_id,
                     self.fs.clone(),
                     self.block_device.clone(),
                 ))
@@ -133,6 +150,7 @@ impl Inode {
         Some(Arc::new(Self::new(
             block_id,
             block_offset,
+            new_inode_id,
             self.fs.clone(),
             self.block_device.clone(),
         )))
@@ -182,5 +200,134 @@ impl Inode {
             }
         });
         block_cache_sync_all();
+    }
+
+    /// 获取当前 inode 的元信息快照
+    pub fn metadata(&self) -> InodeMeta {
+        self.read_disk_inode(|disk_inode| InodeMeta {
+            inode_id: self.inode_id,
+            size: disk_inode.size,
+            is_dir: disk_inode.is_dir(),
+            nlink: disk_inode.nlink,
+        })
+    }
+
+    /// 在当前目录下为 `inode_id` 指向的 inode 建立名为 `name` 的硬链接。
+    ///
+    /// 成功返回 0；名字已存在或当前 inode 不是目录时返回 -1。
+    pub fn link(&self, name: &str, inode_id: u32) -> isize {
+        let mut fs = self.fs.lock();
+        // 同名目录项已存在
+        if self
+            .read_disk_inode(|dir_inode| self.find_inode_id(name, dir_inode))
+            .is_some()
+        {
+            return -1;
+        }
+        if !self.read_disk_inode(|dir_inode| dir_inode.is_dir()) {
+            return -1;
+        }
+        // 目标 inode 的硬链接数加一
+        let (blk, off) = fs.get_disk_inode_pos(inode_id);
+        get_block_cache(blk as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(off, |disk_inode: &mut DiskInode| {
+                disk_inode.nlink += 1;
+            });
+        // 目录末尾追加一个目录项
+        self.modify_disk_inode(|dir_inode: &mut DiskInode| {
+            let file_count = (dir_inode.size as usize) / DIRENT_SZ;
+            let new_size = ((file_count + 1) * DIRENT_SZ) as u32;
+            self.increase_size(new_size, dir_inode, &mut fs);
+            let dirent = DirEntry::new(name, inode_id);
+            dir_inode.write_at(
+                file_count * DIRENT_SZ,
+                dirent.as_bytes(),
+                &self.block_device,
+            );
+        });
+        block_cache_sync_all();
+        0
+    }
+
+    /// 删除当前目录下名为 `name` 的目录项，并把目标 inode 的 nlink 减一；
+    ///
+    /// nlink 归零时回收该 inode 及其占用的数据块。成功返回 0，失败返回 -1。
+    pub fn unlink(&self, name: &str) -> isize {
+        let mut fs = self.fs.lock();
+        let inode_id = match self.read_disk_inode(|dir_inode| self.find_inode_id(name, dir_inode)) {
+            Some(id) => id,
+            None => return -1,
+        };
+        // 从目录里摘掉该目录项：把最后一项搬到空出来的位置，再收缩 size
+        let removed = self.modify_disk_inode(|dir_inode: &mut DiskInode| {
+            let file_count = (dir_inode.size as usize) / DIRENT_SZ;
+            let mut target = file_count;
+            for i in 0..file_count {
+                let mut dirent = DirEntry::empty();
+                assert_eq!(
+                    dir_inode.read_at(i * DIRENT_SZ, dirent.as_bytes_mut(), &self.block_device),
+                    DIRENT_SZ
+                );
+                if dirent.name() == name {
+                    target = i;
+                    break;
+                }
+            }
+            if target == file_count {
+                return false;
+            }
+            let last = file_count - 1;
+            if target != last {
+                let mut last_dirent = DirEntry::empty();
+                assert_eq!(
+                    dir_inode.read_at(
+                        last * DIRENT_SZ,
+                        last_dirent.as_bytes_mut(),
+                        &self.block_device
+                    ),
+                    DIRENT_SZ
+                );
+                dir_inode.write_at(
+                    target * DIRENT_SZ,
+                    last_dirent.as_bytes(),
+                    &self.block_device,
+                );
+            }
+            dir_inode.size = (last * DIRENT_SZ) as u32;
+            true
+        });
+        if !removed {
+            return -1;
+        }
+        // 目标 inode 的 nlink 减一
+        let (blk, off) = fs.get_disk_inode_pos(inode_id);
+        let nlink = get_block_cache(blk as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(off, |disk_inode: &mut DiskInode| {
+                if disk_inode.nlink > 0 {
+                    disk_inode.nlink -= 1;
+                }
+                disk_inode.nlink
+            });
+        // 没有任何硬链接了，回收数据块与 inode（目录不在此处回收）
+        if nlink == 0 {
+            let is_dir = get_block_cache(blk as usize, Arc::clone(&self.block_device))
+                .lock()
+                .read(off, |disk_inode: &DiskInode| disk_inode.is_dir());
+            if !is_dir {
+                let blocks = get_block_cache(blk as usize, Arc::clone(&self.block_device))
+                    .lock()
+                    .modify(off, |disk_inode: &mut DiskInode| {
+                        disk_inode.clear_size(&self.block_device)
+                    });
+                for block in blocks.into_iter() {
+                    fs.dealloc_data(block);
+                }
+                fs.dealloc_inode(inode_id);
+            }
+        }
+        block_cache_sync_all();
+        0
     }
 }

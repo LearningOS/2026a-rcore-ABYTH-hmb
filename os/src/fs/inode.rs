@@ -4,7 +4,7 @@
 //!
 //! `UPSafeCell<OSInodeInner>` -> `OSInode`: for static `ROOT_INODE`,we
 //! need to wrap `OSInodeInner` into `UPSafeCell`
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -35,6 +35,22 @@ impl OSInode {
             readable,
             writable,
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
+        }
+    }
+    /// 获取文件的元信息快照
+    pub fn metadata(&self) -> Stat {
+        let inner = self.inner.exclusive_access();
+        let meta = inner.inode.metadata();
+        Stat {
+            dev: 0,
+            ino: meta.inode_id as u64,
+            mode: if meta.is_dir {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            },
+            nlink: meta.nlink,
+            pad: [0; 7],
         }
     }
     /// read all data from the inode
@@ -128,6 +144,9 @@ pub fn open_file(name: &str, flags: OpenFlags) -> Option<Arc<OSInode>> {
 impl File for OSInode {
     fn readable(&self) -> bool {
         self.readable
+    }
+    fn stat(&self) -> Stat {
+        self.metadata()
     }
     fn writable(&self) -> bool {
         self.writable

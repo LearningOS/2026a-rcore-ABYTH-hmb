@@ -3,12 +3,17 @@
 use alloc::sync::Arc;
 
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
-    task::{
-        add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+    mm::{
+        translated_refmut, translated_str, write_user_bytes, MapPermission, VirtAddr,
+        USER_SPACE_TOP,
     },
+    task::{
+        add_task, current_task, current_user_token, exit_current_and_run_next, mmap_current_area,
+        munmap_current_area, suspend_current_and_run_next, TaskControlBlock,
+    },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -105,30 +110,67 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// YOUR JOB: get time with second and microsecond
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    // TimeVal 占 16 字节，可能横跨两个页面，必须逐页写而不能直接用裸指针
+    let data = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    if write_user_bytes(current_user_token(), ts as usize, data) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    // 长度非 0、起点页对齐、prot 只能是 R/W/X 的组合且至少有一位
+    if len == 0 || start % PAGE_SIZE != 0 || prot == 0 || prot & !0b111 != 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) if end <= USER_SPACE_TOP => end,
+        _ => return -1,
+    };
+    // POSIX 的 PROT_READ/WRITE/EXEC 恰好对应 MapPermission 的 R/W/X 位（都从 bit1 起）
+    let perm = match MapPermission::from_bits(((prot as u8) << 1) | MapPermission::U.bits()) {
+        Some(perm) => perm,
+        None => return -1,
+    };
+    if mmap_current_area(VirtAddr::from(start), VirtAddr::from(end), perm) {
+        flush_tlb();
+        0
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    if len == 0 || start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) if end <= USER_SPACE_TOP => end,
+        _ => return -1,
+    };
+    if munmap_current_area(VirtAddr::from(start), VirtAddr::from(end)) {
+        flush_tlb();
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -143,12 +185,29 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let data = match open_file(path.as_str(), OpenFlags::RDONLY) {
+        Some(inode) => inode.read_all(),
+        None => return -1,
+    };
+    let parent = current_task().unwrap();
+    let child = TaskControlBlock::new(data.as_slice());
+    let pid = child.getpid();
+    // 记录父进程（Weak 不增加引用计数，避免循环引用）
+    child.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+    let child = Arc::new(child);
+    // 挂到父进程的 children 列表，否则 waitpid 找不到它
+    parent.inner_exclusive_access().children.push(child.clone());
+    add_task(child);
+    pid as isize
+}
+
+/// 修改页表后刷新 TLB，避免残留的旧映射被继续使用
+fn flush_tlb() {
+    unsafe { core::arch::asm!("sfence.vma") };
 }
 
 // YOUR JOB: Set task priority.

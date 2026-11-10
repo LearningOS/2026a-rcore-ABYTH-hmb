@@ -1,5 +1,6 @@
 //! Implementation of [`PageTableEntry`] and [`PageTable`].
 use super::{frame_alloc, FrameTracker, PhysAddr, PhysPageNum, StepByOne, VirtAddr, VirtPageNum};
+use crate::config::PAGE_SIZE;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -156,6 +157,37 @@ impl PageTable {
     pub fn token(&self) -> usize {
         8usize << 60 | self.root_ppn.0
     }
+}
+
+/// SV39 下用户态规范虚拟地址的上界（2^38）。
+///
+/// 高于它的地址（如 `isize::MAX`）在硬件看来是非规范地址，但内核读取一级页表时
+/// 只保留低 27 位索引，会绕回到跳板页所在的页表项，因此必须在查表前显式拦掉。
+pub const USER_SPACE_TOP: usize = 1 << 38;
+
+/// 把 `data` 逐字节写到用户地址空间 `addr` 处，跨页时逐页查表。
+///
+/// 与 [`translated_byte_buffer`] 不同，任一页未映射或没有写权限时返回 `false`
+/// 而不是 panic，供系统调用在收到非法用户指针时安全地返回 -1。
+pub fn write_user_bytes(token: usize, addr: usize, data: &[u8]) -> bool {
+    match addr.checked_add(data.len()) {
+        Some(end) if end <= USER_SPACE_TOP => {}
+        _ => return false,
+    }
+    let page_table = PageTable::from_token(token);
+    let mut done = 0usize;
+    while done < data.len() {
+        let va = VirtAddr::from(addr + done);
+        let pte = match page_table.translate(va.floor()) {
+            Some(pte) if pte.is_valid() && pte.writable() => pte,
+            _ => return false,
+        };
+        let offset = va.page_offset();
+        let n = core::cmp::min(PAGE_SIZE - offset, data.len() - done);
+        pte.ppn().get_bytes_array()[offset..offset + n].copy_from_slice(&data[done..done + n]);
+        done += n;
+    }
+    true
 }
 
 /// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through page table

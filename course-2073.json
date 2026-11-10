@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "courseId": 2073,
+  "repository": "LearningOS/2026a-rcore-ABYTH-hmb",
+  "user": "ABYTH-hmb",
+  "totalScore": 500,
+  "chapters": {
+    "ch3": {
+      "points": "7/7",
+      "score": 100,
+      "commit": "333cd8c5bc4e4e01dd234f8fe340cad31cc7b6e4"
+    }
+  },
+  "score": 100,
+  "upload": {
+    "status": "pending",
+    "runId": "42798462211",
+    "runAttempt": "1"
+  }
+}

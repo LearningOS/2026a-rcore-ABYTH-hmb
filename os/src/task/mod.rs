@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -133,6 +134,47 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// 递增当前任务的系统调用计数
+    fn incr_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let counter = inner.tasks[cur]
+            .syscall_counts
+            .entry(syscall_id)
+            .or_insert(0u32);
+        *counter = counter.wrapping_add(1);
+    }
+
+    /// 查询当前任务对某个系统调用的计数
+    fn syscall_count(&self, syscall_id: usize) -> isize {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur]
+            .syscall_counts
+            .get(&syscall_id)
+            .copied()
+            .unwrap_or(0) as isize
+    }
+
+    /// 在当前任务的地址空间中建立一段映射，区间被占用则返回 false
+    fn map_current_area(&self, start_va: VirtAddr, end_va: VirtAddr, perm: MapPermission) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let memory_set = &mut inner.tasks[cur].memory_set;
+        if !memory_set.is_range_free(start_va, end_va) {
+            return false;
+        }
+        memory_set.insert_framed_area(start_va, end_va, perm);
+        true
+    }
+
+    /// 解除当前任务地址空间中 [start_va, end_va) 的映射，失败返回 false
+    fn munmap_current_area(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.unmap_range(start_va, end_va)
+    }
+
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -201,4 +243,24 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// 递增当前任务的系统调用计数
+pub fn incr_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.incr_syscall_count(syscall_id);
+}
+
+/// 查询当前任务对某个系统调用的计数
+pub fn syscall_count(syscall_id: usize) -> isize {
+    TASK_MANAGER.syscall_count(syscall_id)
+}
+
+/// 在当前任务地址空间中映射一段区间
+pub fn mmap_current_area(start_va: VirtAddr, end_va: VirtAddr, perm: MapPermission) -> bool {
+    TASK_MANAGER.map_current_area(start_va, end_va, perm)
+}
+
+/// 解除当前任务地址空间中的一段映射
+pub fn munmap_current_area(start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    TASK_MANAGER.munmap_current_area(start_va, end_va)
 }

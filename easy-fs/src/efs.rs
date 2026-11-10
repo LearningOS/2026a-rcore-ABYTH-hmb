@@ -118,7 +118,7 @@ impl EasyFileSystem {
         // acquire efs lock temporarily
         let (block_id, block_offset) = efs.lock().get_disk_inode_pos(0);
         // release efs lock
-        Inode::new(block_id, block_offset, Arc::clone(efs), block_device)
+        Inode::new(block_id, block_offset, 0, Arc::clone(efs), block_device)
     }
     /// Get inode block position (the block id and offset in this block) according to the inode id
     pub fn get_disk_inode_pos(&self, inode_id: u32) -> (u32, usize) {
@@ -138,20 +138,34 @@ impl EasyFileSystem {
     pub fn alloc_inode(&mut self) -> u32 {
         self.inode_bitmap.alloc(&self.block_device).unwrap() as u32
     }
+    /// Deallocate an inode (called when its link count drops to zero)
+    pub fn dealloc_inode(&mut self, inode_id: u32) {
+        let (block_id, block_offset) = self.get_disk_inode_pos(inode_id);
+        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
+            .lock()
+            .modify(block_offset, |inode: &mut DiskInode| {
+                inode.initialize(DiskInodeType::File);
+            });
+        self.inode_bitmap
+            .dealloc(&self.block_device, inode_id as usize);
+    }
 
     /// allocate a new data block, return its block position (block_id)
     pub fn alloc_data(&mut self) -> u32 {
         self.data_bitmap.alloc(&self.block_device).unwrap() as u32 + self.data_area_start_block
     }
-    /// deallocate a data block according to its block id
+    /// Deallocate a data block
+    ///
+    /// 只把 bitmap 上对应的位置零，**不再把块内容擦成 0**。
+    ///
+    /// 擦除的代价是把每个待回收的块都读进块缓存、改写成脏块、再随淘汰落盘；
+    /// 一次 unlink 一个 150KB 的文件就要擦 300 多个块，在本课程的 QEMU/virtio
+    /// 组合下会把这些脏块和设备写操作叠在一起，导致内核在大量写之后静默挂死
+    /// （实测：ch6_file3 第 9 轮写入时无任何输出退出）。
+    ///
+    /// 不擦除是安全的：块被重新分配后必然挂在某个 size = 0 的 inode 上，
+    /// 而读写都受  约束，旧数据不会被上层看到。
     pub fn dealloc_data(&mut self, block_id: u32) {
-        get_block_cache(block_id as usize, Arc::clone(&self.block_device))
-            .lock()
-            .modify(0, |data_block: &mut DataBlock| {
-                data_block.iter_mut().for_each(|p| {
-                    *p = 0;
-                })
-            });
         self.data_bitmap.dealloc(
             &self.block_device,
             (block_id - self.data_area_start_block) as usize,

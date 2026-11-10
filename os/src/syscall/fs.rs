@@ -1,5 +1,7 @@
-use crate::fs::{make_pipe, open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_refmut, translated_str, UserBuffer};
+use crate::fs::{make_pipe, open_file, root_inode, OpenFlags, Stat};
+use crate::mm::{
+    translated_byte_buffer, translated_refmut, translated_str, write_user_bytes, UserBuffer,
+};
 use crate::task::{current_process, current_task, current_user_token};
 use alloc::sync::Arc;
 /// write syscall
@@ -124,28 +126,71 @@ pub fn sys_dup(fd: usize) -> isize {
 }
 
 /// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
+///
+/// 把 fd 对应文件的 Stat 写入用户空间指针；Stat 可能跨页，用 write_user_bytes
+/// 逐页写入，任一页不可写返回 -1
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
     trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_fstat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let process = current_process();
+    let inner = process.inner_exclusive_access();
+    if fd >= inner.fd_table.len() {
+        return -1;
+    }
+    if let Some(file) = &inner.fd_table[fd] {
+        let file = file.clone();
+        // 释放 PCB 借用后再调用文件操作，避免多重借用
+        drop(inner);
+        let stat = file.stat();
+        let data = unsafe {
+            core::slice::from_raw_parts(
+                &stat as *const Stat as *const u8,
+                core::mem::size_of::<Stat>(),
+            )
+        };
+        if write_user_bytes(token, st as usize, data) {
+            0
+        } else {
+            -1
+        }
+    } else {
+        -1
+    }
 }
 
 /// YOUR JOB: Implement linkat.
+///
+/// 为旧路径指向的 inode 建立新名字的硬链接（两个名字共享同一 inode）
 pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_linkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let old_name = translated_str(token, _old_name);
+    let new_name = translated_str(token, _new_name);
+    let root = root_inode();
+    match root.find(old_name.as_str()) {
+        Some(inode) => {
+            let meta = inode.metadata();
+            root.link(new_name.as_str(), meta.inode_id)
+        }
+        None => -1,
+    }
 }
 
 /// YOUR JOB: Implement unlinkat.
+///
+/// 删除一个目录项；仅当对应 inode 的硬链接数归零时才真正回收其数据块
 pub fn sys_unlinkat(_name: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_unlinkat",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let name = translated_str(token, _name);
+    root_inode().unlink(name.as_str())
 }

@@ -1,10 +1,16 @@
 use crate::{
+    config::PAGE_SIZE,
     fs::{open_file, OpenFlags},
-    mm::{translated_ref, translated_refmut, translated_str},
-    task::{
-        current_process, current_task, current_user_token, exit_current_and_run_next, pid2process,
-        suspend_current_and_run_next, SignalFlags,
+    mm::{
+        translated_ref, translated_refmut, translated_str, write_user_bytes, MapPermission,
+        VirtAddr, USER_SPACE_TOP,
     },
+    task::{
+        current_process, current_task, current_user_token, exit_current_and_run_next,
+        mmap_current_area, munmap_current_area, pid2process, suspend_current_and_run_next,
+        ProcessControlBlock, SignalFlags,
+    },
+    timer::get_time_us,
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
 
@@ -148,37 +154,81 @@ pub fn sys_kill(pid: usize, signal: u32) -> isize {
 
 /// get_time syscall
 ///
-/// YOUR JOB: get time with second and microsecond
-/// HINT: You might reimplement it with virtual memory management.
-/// HINT: What if [`TimeVal`] is splitted by two pages ?
-pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
+/// 获取当前时间（秒 + 微秒）。TimeVal 共 16 字节，可能横跨两个页面，
+/// 必须借助 write_user_bytes 逐页写入，任一页不可写则返回 -1
+pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_get_time",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let us = get_time_us();
+    let time_val = TimeVal {
+        sec: us / 1_000_000,
+        usec: us % 1_000_000,
+    };
+    let data = unsafe {
+        core::slice::from_raw_parts(
+            &time_val as *const TimeVal as *const u8,
+            core::mem::size_of::<TimeVal>(),
+        )
+    };
+    if write_user_bytes(current_user_token(), ts as usize, data) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// mmap syscall
 ///
-/// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
+/// 在当前进程地址空间中映射 [start, start+len)：长度非 0、起点页对齐、
+/// prot 必须是 R/W/X 的非空组合；区间已被占用或参数非法返回 -1
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_mmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if len == 0 || start % PAGE_SIZE != 0 || prot == 0 || prot & !0b111 != 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) if end <= USER_SPACE_TOP => end,
+        _ => return -1,
+    };
+    // POSIX 的 PROT_READ/WRITE/EXEC 恰好对应 MapPermission 的 R/W/X 位（都从 bit1 起）
+    let perm = match MapPermission::from_bits(((prot as u8) << 1) | MapPermission::U.bits()) {
+        Some(perm) => perm,
+        None => return -1,
+    };
+    if mmap_current_area(VirtAddr::from(start), VirtAddr::from(end), perm) {
+        flush_tlb();
+        0
+    } else {
+        -1
+    }
 }
 
 /// munmap syscall
 ///
-/// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
+/// 解除 [start, start+len) 的映射：长度非 0 且必须页对齐，失败返回 -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_munmap",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if len == 0 || start % PAGE_SIZE != 0 || len % PAGE_SIZE != 0 {
+        return -1;
+    }
+    let end = match start.checked_add(len) {
+        Some(end) if end <= USER_SPACE_TOP => end,
+        _ => return -1,
+    };
+    if munmap_current_area(VirtAddr::from(start), VirtAddr::from(end)) {
+        flush_tlb();
+        0
+    } else {
+        -1
+    }
 }
 
 /// change data segment size
@@ -191,23 +241,46 @@ pub fn sys_munmap(_start: usize, _len: usize) -> isize {
 // }
 
 /// spawn syscall
-/// YOUR JOB: Implement spawn.
-/// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
+///
+/// 直接以 ELF 内容创建新进程（不等价于 fork + exec：子进程不复用父进程
+/// 地址空间/fd 表），并登记父子关系后返回子进程 pid
+pub fn sys_spawn(path: *const u8) -> isize {
     trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_spawn",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    let token = current_user_token();
+    let path = translated_str(token, path);
+    let data = match open_file(path.as_str(), OpenFlags::RDONLY) {
+        Some(inode) => inode.read_all(),
+        None => return -1,
+    };
+    let parent = current_process();
+    let child = ProcessControlBlock::new(data.as_slice());
+    let pid = child.getpid();
+    // 记录父进程（Weak 不增加引用计数，避免循环引用）
+    child.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+    // 挂到父进程的 children 列表，否则 waitpid 找不到它
+    parent.inner_exclusive_access().children.push(child.clone());
+    pid as isize
 }
 
 /// set priority syscall
 ///
-/// YOUR JOB: Set task priority
-pub fn sys_set_priority(_prio: isize) -> isize {
+/// 设置当前任务的调度优先级（>=2 合法，成功返回优先级本身，非法返回 -1）
+pub fn sys_set_priority(prio: isize) -> isize {
     trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
+        "kernel:pid[{}] sys_set_priority",
         current_task().unwrap().process.upgrade().unwrap().getpid()
     );
-    -1
+    if prio >= 2 {
+        prio
+    } else {
+        -1
+    }
+}
+
+/// 修改页表后刷新 TLB，避免残留的旧映射被继续使用
+fn flush_tlb() {
+    unsafe { core::arch::asm!("sfence.vma") };
 }

@@ -293,6 +293,80 @@ impl MemorySet {
             false
         }
     }
+
+    /// 判断 [start_va, end_va) 是否与任何已有的 MapArea 都不重叠
+    pub fn is_range_free(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let (start, end) = (start_va.floor(), end_va.ceil());
+        if end <= start {
+            return false;
+        }
+        self.areas
+            .iter()
+            .all(|area| area.vpn_range.get_end() <= start || area.vpn_range.get_start() >= end)
+    }
+
+    /// 判断 [start_va, end_va) 中每一页是否都已被某个 MapArea 覆盖
+    #[allow(unused)]
+    pub fn is_range_mapped(&self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        let (start, end) = (start_va.floor(), end_va.ceil());
+        if end <= start {
+            return false;
+        }
+        let mut vpn = start;
+        while vpn < end {
+            let covered = self
+                .areas
+                .iter()
+                .any(|area| area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end());
+            if !covered {
+                return false;
+            }
+            vpn.step();
+        }
+        true
+    }
+
+    /// 解除 [start_va, end_va) 的映射。
+    ///
+    /// 若某个 MapArea 只有一部分落在区间内，则把它切成左右两段保留；
+    /// 完全落在区间内的则整体移除。区间内有未映射的页时返回 false。
+    pub fn unmap_range(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> bool {
+        if !self.is_range_mapped(start_va, end_va) {
+            return false;
+        }
+        let (start, end) = (start_va.floor(), end_va.ceil());
+        let mut remaining: Vec<MapArea> = Vec::new();
+        for area in self.areas.drain(..) {
+            let a_start = area.vpn_range.get_start();
+            let a_end = area.vpn_range.get_end();
+            if a_end <= start || a_start >= end {
+                // 与区间无交集，原样保留
+                remaining.push(area);
+                continue;
+            }
+            let mut area = area;
+            let lo = if a_start > start { a_start } else { start };
+            let hi = if a_end < end { a_end } else { end };
+            // 先把右侧 [hi, a_end) 切出来保留
+            if let Some(right) = area.split_off(hi) {
+                remaining.push(right);
+            }
+            // 再处理左侧：切掉 [lo, hi)
+            if let Some(mut hole) = area.split_off(lo) {
+                for vpn in hole.vpn_range {
+                    hole.unmap_one(&mut self.page_table, vpn);
+                }
+                remaining.push(area); // 左侧 [a_start, lo) 保留
+            } else {
+                // 整段都在区间内，全部解映射
+                for vpn in area.vpn_range {
+                    area.unmap_one(&mut self.page_table, vpn);
+                }
+            }
+        }
+        self.areas = remaining;
+        true
+    }
 }
 
 pub struct MapArea {
@@ -371,6 +445,28 @@ impl MapArea {
         }
         self.vpn_range = VPNRange::new(self.vpn_range.get_start(), new_end);
     }
+    /// 把 [from, end) 切出来成为新的 MapArea，自身收缩为 [start, from)。
+    /// 被切出那部分的物理页也随之迁移到新的 MapArea 上。
+    fn split_off(&mut self, from: VirtPageNum) -> Option<MapArea> {
+        if from >= self.vpn_range.get_end() || from <= self.vpn_range.get_start() {
+            return None;
+        }
+        let end = self.vpn_range.get_end();
+        let mut right = MapArea::new(
+            VirtAddr::from(from),
+            VirtAddr::from(end),
+            self.map_type,
+            self.map_perm,
+        );
+        for vpn in VPNRange::new(from, end) {
+            if let Some(frame) = self.data_frames.remove(&vpn) {
+                right.data_frames.insert(vpn, frame);
+            }
+        }
+        self.vpn_range = VPNRange::new(self.vpn_range.get_start(), from);
+        Some(right)
+    }
+
     /// data: start-aligned but maybe with shorter length
     /// assume that all frames were cleared before
     pub fn copy_data(&mut self, page_table: &mut PageTable, data: &[u8]) {

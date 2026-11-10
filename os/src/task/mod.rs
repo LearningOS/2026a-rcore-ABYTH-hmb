@@ -22,11 +22,12 @@ mod task;
 use self::id::TaskUserRes;
 use crate::fs::{open_file, OpenFlags};
 use crate::task::manager::add_stopping_task;
+use crate::mm::{MapPermission, VirtAddr};
 use crate::timer::remove_timer;
 use alloc::{sync::Arc, vec::Vec};
 use lazy_static::*;
 use manager::fetch_task;
-use process::ProcessControlBlock;
+pub use process::{ProcessControlBlock, ProcessControlBlockInner};
 use switch::__switch;
 
 pub use context::TaskContext;
@@ -38,6 +39,24 @@ pub use processor::{
 };
 pub use signal::SignalFlags;
 pub use task::{TaskControlBlock, TaskStatus};
+
+/// 在当前进程地址空间中映射 [start_va, end_va)，区间已被占用则返回 false
+pub fn mmap_current_area(start_va: VirtAddr, end_va: VirtAddr, perm: MapPermission) -> bool {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    if !inner.memory_set.is_range_free(start_va, end_va) {
+        return false;
+    }
+    inner.memory_set.insert_framed_area(start_va, end_va, perm);
+    true
+}
+
+/// 解除当前进程地址空间中 [start_va, end_va) 的映射，失败返回 false
+pub fn munmap_current_area(start_va: VirtAddr, end_va: VirtAddr) -> bool {
+    let process = current_process();
+    let mut inner = process.inner_exclusive_access();
+    inner.memory_set.unmap_range(start_va, end_va)
+}
 
 /// Make current task suspended and switch to the next task
 pub fn suspend_current_and_run_next() {

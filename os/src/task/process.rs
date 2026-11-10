@@ -49,6 +49,18 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// 死锁检测开关（sys_enable_deadlock_detect 控制）
+    pub deadlock_detect: bool,
+    /// mutex_id -> 持有者 tid；None 表示空闲（死锁检测账本）
+    pub mutex_allocation: Vec<Option<usize>>,
+    /// tid -> 正在阻塞等待的 mutex_id（死锁检测账本）
+    pub mutex_request: Vec<Option<usize>>,
+    /// semaphore_allocation[tid][sem_id]：线程持有的信号量单元数（死锁检测账本）
+    pub semaphore_allocation: Vec<Vec<isize>>,
+    /// semaphore_request[tid][sem_id]：线程阻塞等待中的单元数（死锁检测账本）
+    pub semaphore_request: Vec<Vec<isize>>,
+    /// 各信号量的可用单元计数镜像（死锁检测的 work 向量）
+    pub semaphore_available: Vec<isize>,
 }
 
 impl ProcessControlBlockInner {
@@ -119,6 +131,12 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_allocation: Vec::new(),
+                    mutex_request: Vec::new(),
+                    semaphore_allocation: Vec::new(),
+                    semaphore_request: Vec::new(),
+                    semaphore_available: Vec::new(),
                 })
             },
         });
@@ -245,6 +263,12 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_allocation: Vec::new(),
+                    mutex_request: Vec::new(),
+                    semaphore_allocation: Vec::new(),
+                    semaphore_request: Vec::new(),
+                    semaphore_available: Vec::new(),
                 })
             },
         });

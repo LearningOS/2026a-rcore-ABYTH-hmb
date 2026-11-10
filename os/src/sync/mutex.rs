@@ -12,6 +12,8 @@ pub trait Mutex: Sync + Send {
     fn lock(&self);
     /// Unlock the mutex
     fn unlock(&self);
+    /// 锁当前是否被持有（死锁检测用来判断请求是否会阻塞）
+    fn is_locked(&self) -> bool;
 }
 
 /// Spinlock Mutex struct
@@ -49,6 +51,10 @@ impl Mutex for MutexSpin {
         trace!("kernel: MutexSpin::unlock");
         let mut locked = self.locked.exclusive_access();
         *locked = false;
+    }
+    /// 锁当前是否被持有
+    fn is_locked(&self) -> bool {
+        *self.locked.exclusive_access()
     }
 }
 
@@ -101,5 +107,9 @@ impl Mutex for MutexBlocking {
         } else {
             mutex_inner.locked = false;
         }
+    }
+    /// 锁当前是否被持有
+    fn is_locked(&self) -> bool {
+        self.inner.exclusive_access().locked
     }
 }

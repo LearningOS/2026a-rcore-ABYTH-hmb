@@ -100,7 +100,8 @@ pub struct DiskInode {
     pub indirect1: u32,
     /// two-level indirect block id
     pub indirect2: u32,
-    /// inode type
+    /// 硬链接数：新建时为 1，`link` 加一，`unlink` 减一，归零才回收 inode
+    pub nlink: u32,
     type_: DiskInodeType,
 }
 
@@ -111,6 +112,7 @@ impl DiskInode {
         self.direct.iter_mut().for_each(|v| *v = 0);
         self.indirect1 = 0;
         self.indirect2 = 0;
+        self.nlink = 1;
         self.type_ = type_;
     }
     /// inode is directory?

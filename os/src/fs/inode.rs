@@ -1,4 +1,4 @@
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -30,6 +30,22 @@ impl OSInode {
             inner: unsafe { UPSafeCell::new(OSInodeInner { offset: 0, inode }) },
         }
     }
+    /// 获取文件的元信息快照（fstat 用）
+    pub fn metadata(&self) -> Stat {
+        let inner = self.inner.exclusive_access();
+        let meta = inner.inode.metadata();
+        Stat {
+            dev: 0,
+            ino: meta.inode_id as u64,
+            mode: if meta.is_dir {
+                StatMode::DIR
+            } else {
+                StatMode::FILE
+            },
+            nlink: meta.nlink,
+            pad: [0; 7],
+        }
+    }
     /// read all data from the inode in memory
     pub fn read_all(&self) -> Vec<u8> {
         trace!("kernel: OSInode::read_all");
@@ -54,6 +70,11 @@ lazy_static! {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
     };
+}
+
+/// 返回根目录 Inode（供 linkat/unlinkat 系统调用使用）
+pub fn root_inode() -> Arc<Inode> {
+    ROOT_INODE.clone()
 }
 
 /// List all apps in the root directory

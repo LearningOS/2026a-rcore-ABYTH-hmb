@@ -14,6 +14,8 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use alloc::collections::BTreeMap;
+
 use crate::config::MAX_APP_NUM;
 use crate::loader::{get_num_app, init_app_cx};
 use crate::sync::UPSafeCell;
@@ -51,10 +53,11 @@ lazy_static! {
     /// Global variable: TASK_MANAGER
     pub static ref TASK_MANAGER: TaskManager = {
         let num_app = get_num_app();
-        let mut tasks = [TaskControlBlock {
+        let mut tasks: [TaskControlBlock; MAX_APP_NUM] = core::array::from_fn(|_| TaskControlBlock {
             task_cx: TaskContext::zero_init(),
             task_status: TaskStatus::UnInit,
-        }; MAX_APP_NUM];
+            syscall_counts: BTreeMap::new(),
+        });
         for (i, task) in tasks.iter_mut().enumerate() {
             task.task_cx = TaskContext::goto_restore(init_app_cx(i));
             task.task_status = TaskStatus::Ready;
@@ -135,6 +138,28 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+
+    /// Increment the syscall counter of the current `Running` task by one.
+    fn incr_syscall_count(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        let count = inner.tasks[current]
+            .syscall_counts
+            .entry(syscall_id)
+            .or_insert(0);
+        *count = count.wrapping_add(1);
+    }
+
+    /// Get the syscall counter value of the current `Running` task.
+    fn syscall_count(&self, syscall_id: usize) -> isize {
+        let inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current]
+            .syscall_counts
+            .get(&syscall_id)
+            .copied()
+            .unwrap_or(0) as isize
+    }
 }
 
 /// Run the first task in task list.
@@ -168,4 +193,14 @@ pub fn suspend_current_and_run_next() {
 pub fn exit_current_and_run_next() {
     mark_current_exited();
     run_next_task();
+}
+
+/// Increment the syscall counter of the current `Running` task by one.
+pub fn incr_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.incr_syscall_count(syscall_id);
+}
+
+/// Get the syscall counter value of the current `Running` task.
+pub fn syscall_count(syscall_id: usize) -> isize {
+    TASK_MANAGER.syscall_count(syscall_id)
 }
